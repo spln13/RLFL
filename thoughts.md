@@ -9,5 +9,5 @@
 
 
 ## 要点
-1. 模型选择常见模型如resnet
-2. 模型剪枝算法使用带mask的weight pruning
+1. 模型选择常见模型如vgg小模型
+2. 模型剪枝算法继续使用network slimming
