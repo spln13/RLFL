@@ -40,6 +40,9 @@ class Client(object):
         return DataLoader(train_data, batch_size, drop_last=True, shuffle=True)
         pass
 
+    def load_small_model(self):
+        return MiniVGG(cfg=[32, 64, 128, 128, 256, 256, 512, 512], dataset=self.dataset)
+
     def load_model(self):
         checkpoint = torch.load(self.model_path)
         cfg = checkpoint['cfg']
@@ -62,7 +65,7 @@ class Client(object):
         pass
 
     def train(self, sr=False):
-        """模型训练制定epoch，需要统计训练时间"""
+        """模型训练制定epoch，需要统计训练时间，sr为是否加上network slimming的正则项"""
         model = self.load_model()
         epochs = self.training_intensity  # 训练强度
         model = model.to(self.device)
@@ -261,3 +264,32 @@ class Client(object):
 
 
         return new_model
+
+
+    def first_evaluate(self):
+        """
+        算法开始时，训练小模型得到训练时间T
+        """
+        model = self.load_small_model()
+        # train model
+        epoch = 1
+        model = model.to(self.device)
+        train_loader = self.load_train_data()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
+        criterion = nn.CrossEntropyLoss()
+        losses = []
+        start_time = time.time()
+        for epoch in range(epoch):
+            model.train()
+            train_loader_tqdm = tqdm(enumerate(train_loader), total=len(train_loader), leave=False)
+            for batch_idx, (data, target) in train_loader_tqdm:
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                losses.append(loss.item())
+                loss.backward()
+                optimizer.step()
+                train_loader_tqdm.set_description(f'Train Epoch: {epoch} Loss: {loss.item():.6f}')
+        end_time = time.time()
+        return end_time - start_time

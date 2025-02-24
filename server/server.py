@@ -4,6 +4,8 @@ import torch.nn as nn
 from model.vgg import MiniVGG
 from PPOModelSize import PPOModelSize
 from PPOEpochAllocation import PPOEpochAllocation
+from PPO.PPO import ContinuousPPOAgent
+from PPO.pruning_rate_ppo import PruningPPOAgent
 
 
 class Server(object):
@@ -11,11 +13,8 @@ class Server(object):
         self.device = device
         self.clients = clients  # list of Client objects
         self.dataset = dataset
-        # state_dim, action_dim, n_latent_var, lr, betas, gamma, K_epochs, eps_clip
-        self.policyNetworkModelSize = PPOModelSize(1, [2], 256, 0.02, (0.9, 0.999), 0.99, 5, 0.2)
-        # state_dim, action_dim, action_std, lr, betas, gamma, K_epochs, eps_clip
-        self.policyNetworkEpochAllocation = PPOEpochAllocation(6, 6, 0.5, 0.0003, (0.9, 0.999), 0.00, 5, 0.2)
-
+        self.pruningPPOAgent = PruningPPOAgent(5, 3)
+        self.ContinuousPPOAgent = ContinuousPPOAgent(5, 3)
 
     def aggregate(self):
         cluster_model = MiniVGG()
@@ -104,3 +103,9 @@ class Server(object):
                         client_layer.weight.data = m0[:, start_indices].clone()
             client.save_model(client_model, client_model.cfg, client_model.mask)
 
+
+    def Run(self):
+        """
+        开始算法过程
+        """
+        pass
