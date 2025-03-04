@@ -24,6 +24,7 @@ class Client(object):
         self.kd_alpha = kd_alpha
         self.temperature = temperature
         self.model_path = save_path + '_client_' + str(client_id) + '.pth'  # checkpoint path
+        self.information_entropy = self.get_information_entropy()
         pass
 
 
@@ -33,15 +34,15 @@ class Client(object):
         train_data = read_client_data(self.dataset, self.id, is_train=True)
         return DataLoader(train_data, batch_size, drop_last=True, shuffle=True)
 
-    def load_test_data(self, batch_size=None):
+    def load_test_data(self, is_local_test=False, batch_size=None):
         if batch_size is None:
             batch_size = self.batch_size
-        train_data = read_client_data(self.dataset, self.id, is_train=False)
+        train_data = read_client_data(self.dataset, self.id, is_train=False, is_local_test=is_local_test)
         return DataLoader(train_data, batch_size, drop_last=True, shuffle=True)
         pass
 
     def load_small_model(self):
-        return MiniVGG(cfg=[32, 64, 128, 128, 256, 256, 512, 512], dataset=self.dataset)
+        return MiniVGG(dataset=self.dataset)
 
     def load_model(self):
         checkpoint = torch.load(self.model_path)
@@ -99,7 +100,9 @@ class Client(object):
         self.save_model(model, model.cfg, model.mask)
         end_time = time.time()
         total_time = end_time - start_time
-        return total_time
+        # 在client本地测试集跑一下得到acc一并返回给server
+        acc = self.local_test()
+        return acc, total_time
 
 
     def finetune(self, model_teacher, model_student, epochs=10, alpha=0.5, temperature=2.0):
@@ -176,6 +179,27 @@ class Client(object):
                                                                                       len(test_loader.dataset),
                                                                                       100. * correct / len(
                                                                                           test_loader.dataset)))
+
+    def local_test(self) -> float:
+        # client使用本地小测试集进行测试，返回准确率供PPO模型参考
+        model = self.load_model()
+        test_loader = self.load_test_data(batch_size=128)
+        model = model.to(self.device)
+        model.eval()
+        correct = 0
+        for data, target in test_loader:
+            data, target = data.to(self.device), target.to(self.device)
+            with torch.no_grad():
+                data, target = data, target
+            output = model(data)
+            pred = output.data.max(1, keepdim=True)[1]
+            correct += pred.eq(target.data.view_as(pred)).cpu().sum()
+        print('\nclient_id: {}, Test acc: {}/{} ({:.1f}%)\n'.format(self.id, correct,
+                                                                    len(test_loader.dataset),
+                                                                    100. * correct / len(
+                                                                        test_loader.dataset)))
+        acc = 100. * correct / len(test_loader.dataset)
+        return acc
 
     def prune(self, pruning_rate):
         model = self.load_model()
@@ -266,6 +290,13 @@ class Client(object):
         return new_model
 
 
+    def get_information_entropy(self):
+        """
+        获取每个client的信息熵, 客户端初始化时调用赋值
+        """
+        return 1
+
+
     def first_evaluate(self):
         """
         算法开始时，训练小模型得到训练时间T
@@ -292,4 +323,9 @@ class Client(object):
                 optimizer.step()
                 train_loader_tqdm.set_description(f'Train Epoch: {epoch} Loss: {loss.item():.6f}')
         end_time = time.time()
-        return end_time - start_time
+        training_time = end_time - start_time
+
+        # 在client本地测试集跑一下得到acc一并返回给server
+        acc = self.local_test()
+
+        return acc, training_time
