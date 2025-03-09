@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 
 from model.vgg import MiniVGG
-from PPO.PPO import ContinuousPPOAgent
 from PPO.pruning_rate_ppo import PruningPPOAgent
 from PPO.training_tensity_ppo import TrainIntensityPPOAgent
 
@@ -107,7 +106,7 @@ class Server(object):
                     m0 = cluster_layer.weight.data[end_indices, :, :, :].clone()
                     with torch.no_grad():
                         client_layer.weight.data = m0[:, start_indices].clone()
-            client.save_model(client_model, client_model.cfg, client_model.mask)
+            client.save_model(client_model, client_model.cfg, client_model.mask)  # 每个client保存自己模型到本地
 
 
     def Run(self):
@@ -140,7 +139,7 @@ class Server(object):
         # (1) 初始模型下发 & 客户端测试训练
         # -------------------------
         print("[Server] Step 1: Distribute initial model, do a test/assessment training")
-        init_assess_info = []
+        init_results = []
 
         for client in self.clients:
             client.init_first_model()  # 下发初始模型
@@ -149,157 +148,143 @@ class Server(object):
             # 让客户端进行一次小规模测试训练(或评估)
             # 假设客户端返回 (acc, time_used) 表示准确率和训练时间
             acc, time_used = client.first_evaluate()
-            init_assess_info.append((acc, time_used))
+            init_results.append((acc, time_used))
 
-
-        # -------------------------
-        # (2) 服务器调用 PPO => 给每个客户端分配 (训练强度, 剪枝率)
-        # -------------------------
-        # 这里需要先构造 "state"。若您有多维特征，可将 (acc, time, 其它信息) 组合到 state 中。
-        # 为简化，假设 state 就放 (acc, time_used) 2维；真实实现中可自行添加
+        # =============== STEP 2: 调用 PPO => 为每个client分配(剪枝率, 训练强度) ===============
+        # 这里需要先定义"state"如何构造, 下面仅示例将 (acc, time_used) 组成 state
         prune_ratios = []
+        prune_logprobs = []
         train_intensities = []
-        for i, (acc, t) in enumerate(init_assess_info):
-            # state_ppo1 / state_ppo2 => 可以相同, 也可不相同
-            # 示例：直接拼成2维
-            state_ppo1 = np.array([acc, t], dtype=np.float32)
-            state_ppo2 = np.array([acc, t], dtype=np.float32)
+        train_logprobs = []
 
-            # 调用 prune_ppo
-            prune_ratio, prune_lp = self.pruningPPOAgent.select_action(state_ppo1)
-            # 建议做一次 clip 或 offset => 保证不至于太小
-            prune_ratio = 0.05 + 0.95 * prune_ratio
+        for (acc, time_used) in init_results:
+            # 1) 构造 state
+            state_ppo1 = np.array([acc, time_used], dtype=np.float32)
+            state_ppo2 = np.array([acc, time_used], dtype=np.float32)
 
-            # 调用 train_ppo
-            train_intensity, train_lp = self.tensityPPOAgent.select_action(state_ppo2)
-            # 同理，可做 clip => 保证 epoch > 1
-            train_intensity = max(1, int(train_intensity * 10))  # 示例: 0~1 => 1~10
+            # 2) 剪枝率 PPO
+            prune_action, prune_lp = self.pruningPPOAgent.select_action(state_ppo1)
+            # 做一个限制, 避免过小
+            prune_action = 0.05 + 0.95 * prune_action
 
-            prune_ratios.append(prune_ratio)
-            train_intensities.append(train_intensity)
+            # 3) 训练强度 PPO
+            train_action, train_lp = self.tensityPPOAgent.select_action(state_ppo2)
+            # 映射到 [1, 10] => epoch
+            # 如果train_action是负值, int时要clip
+            train_action = max(1, int(train_action * 10))
 
-            # 可以把本次(action, logprob)等信息临时存起来，下轮计算reward时要用
-            # 也可等联邦主循环时再行保存
+            # 保存下来
+            prune_ratios.append(prune_action)
+            prune_logprobs.append(prune_lp)
+            train_intensities.append(train_action)
+            train_logprobs.append(train_lp)
 
         print("[Server] PPO generated prune_ratios:", prune_ratios)
         print("[Server] PPO generated train_intensities:", train_intensities)
 
-        # -------------------------
-        # (3) 进入主联邦循环
-        # -------------------------
-
+        # =============== STEP 3: 进入主循环 =================
         round_count = 0
         for r in range(num_rounds):
             round_count += 1
+            done = (r == num_rounds - 1)  # 是否最后一轮
             print(f"\n[Server] Round {round_count} / {num_rounds}")
 
-            # a) 下发本轮策略 (剪枝率, 训练强度)
-            client_infos = []  # 存放本轮各客户端 (acc, time, prune, trainint)
-
+            # (a) 下发本轮 (prune_ratio, train_intensity) 给客户端并训练
+            client_infos = []
             for i, client in enumerate(self.clients):
                 pr = prune_ratios[i]
                 ti = train_intensities[i]
 
-                # 让客户端进行本地训练 (我们只给出接口, 不实现细节)
-                # train(...) 接收 (prune_ratio, train_epochs) 等参数
+                # 客户端本地训练, 传入(剪枝率, 训练轮数)
                 acc, time_used = client.train(pr, ti)
 
-                # 将本次结果记录
-                client_infos.append((acc, time_used, pr, ti))
+                # 记录这次训练得到的信息
+                client_infos.append({
+                    "acc": acc,
+                    "time": time_used,
+                    "old_prune": pr,
+                    "old_prune_lp": prune_logprobs[i],
+                    "old_train_int": ti,
+                    "old_train_lp": train_logprobs[i]
+                })
 
-            # b) 聚合所有客户端模型 => 更新 self.global_model
-            #   aggravate(...) 内部可以做 FedAvg 或其他聚合策略
-            self.aggregate()
+            # (b) 聚合 => 得到新的 global_model
             # self.global_model = self.aggregator(self.clients)
-            print("[Server] Model aggregated, new global model updated.")
+            self.aggregate()
+            print("[Server] Aggregation done, global_model updated.")
 
-            # c) 基于本轮信息, 再次调用 PPO => 产生下一轮动作
-            #    这里我们要先定义如何计算 (state, reward)
-            #    以及如何在 memory 中保存 (state, action, reward, done)
-
+            # (c) 计算 PPO 的 (state, action, reward) 并存储
+            #     同时为下一轮生成新的 (prune_ratio, train_intensity)
             next_prune_ratios = []
+            next_prune_lp = []
             next_train_intensities = []
+            next_train_lp = []
 
-            # 假设 done 一般为 False, 除非在某些场景回合结束
-            done = False if r < (num_rounds - 1) else True
+            for info in client_infos:
+                acc = info["acc"]
+                time_used = info["time"]
+                old_pr = info["old_prune"]
+                old_pr_lp = info["old_prune_lp"]
+                old_ti = info["old_train_int"]
+                old_ti_lp = info["old_train_lp"]
 
-            for i, (acc, time_used, old_pr, old_ti) in enumerate(client_infos):
-                # ------- 1) 构造 state --------
-                # 示例：state依然简单地放 (acc, time_used)
-                s1 = np.array([acc, time_used], dtype=np.float32)  # for prune PPO
-                s2 = np.array([acc, time_used], dtype=np.float32)  # for train PPO
+                # ------- 1) 构造 state -------
+                # 仍然用 (acc, time) 组成 state
+                state_ppo1 = np.array([acc, time_used], dtype=np.float32)
+                state_ppo2 = np.array([acc, time_used], dtype=np.float32)
 
-                # ------- 2) 构造 reward (只是示例公式) -------
-                # 例如: PPO1 reward = acc - 0.2*(模型大小比?)
-                #      这里简单地使用: R1 = acc - old_pr (越多剪枝可能越影响精度)
-                #      您可参考论文需求自定义
-                R1 = float(acc) - old_pr
-
-                # PPO2 reward = - (time 差异?), 这里就简单地 -time 用作示例
-                # or 与上一轮最慢和最快 time 的差相关
+                # ------- 2) Reward 设计(示例) -------
+                # 您可自行定义: 例如 PPO1 reward = acc - old_pr(示例含义:精度越高越好,剪枝越多有惩罚)
+                R1 = float(acc) - float(old_pr)
+                # PPO2 reward = -time_used(示例:时间越长回报越低)
                 R2 = - float(time_used)
 
-                # ------- 3) 把 (state, action, logprob, reward, done) 存进 PPO memory -------
-                # “action”和“logprob” 需要是上一轮 select_action 时得到的
-                #   => 可能需要在上一轮就存下
-                #   => 这里为了演示, 假设我们把 prune_ppo 上次的 logprob 也保存了
-                #      (实际上要么您在上一轮就 store_transition, 要么你这里先获取/回溯)
-
-                # 这里示例写法: 先 naive 地再调一次 select_action(...) 获取 logprob
-                #  - 真实实现中，最好把 old_logprob 在上一轮就存好。
-                # ---- prune part ----
-                _, old_lp_prune = self.pruningPPOAgent.select_action(s1)
+                # ------- 3) 存储到 PPO memory -------
+                # Prune PPO
                 self.pruningPPOAgent.store_transition(
-                    state=s1,
-                    action=old_pr,  # 上一轮动作(剪枝率)
-                    logprob=old_lp_prune,  # 未必准确, 仅做示例
+                    state=state_ppo1,
+                    action=old_pr,
+                    logprob=old_pr_lp,
                     reward=R1,
                     done=done
                 )
-
-                # ---- train part ----
-                _, old_lp_train = self.tensityPPOAgent.select_action(s2)
+                # Train PPO
                 self.tensityPPOAgent.store_transition(
-                    state=s2,
-                    action=old_ti,  # 上一轮动作(训练强度)
-                    logprob=old_lp_train,  # 同理, 仅示例
+                    state=state_ppo2,
+                    action=old_ti,
+                    logprob=old_ti_lp,
                     reward=R2,
                     done=done
                 )
 
-                # ------- 4) 产生下一轮动作(剪枝率, 训练强度) -----------
-                # 这样下一轮再用
-                next_pr, lp_pr = self.pruningPPOAgent.select_action(s1)
-                next_pr = 0.05 + 0.95 * next_pr  # 避免过小
+                # ------- 4) 生成下一轮新动作 -------
+                #  这里再次 select_action, 以便下轮使用
+                #  并做必要的映射 clip
+                npr_action, npr_lp = self.pruningPPOAgent.select_action(state_ppo1)
+                npr_action = 0.05 + 0.95 * npr_action
 
-                next_ti, lp_ti = self.tensityPPOAgent.select_action(s2)
-                next_ti = max(1, int(next_ti * 10))
+                nti_action, nti_lp = self.tensityPPOAgent.select_action(state_ppo2)
+                nti_action = max(1, int(nti_action * 10))
 
-                next_prune_ratios.append(next_pr)
-                next_train_intensities.append(next_ti)
+                next_prune_ratios.append(npr_action)
+                next_prune_lp.append(npr_lp)
+                next_train_intensities.append(nti_action)
+                next_train_lp.append(nti_lp)
 
-            # d) 检查 memory 是否达到了更新阈值 => update PPO
-            #   也可以选择每轮都更新;这里示例按某容量判断
-            # prune PPO
+            # (d) 内存满则更新
             if len(self.pruningPPOAgent.memory['states']) >= self.memory_capacity:
                 print("[Server] prune_ppo memory is full, start update ...")
                 self.pruningPPOAgent.update()
 
-            # train PPO
             if len(self.tensityPPOAgent.memory['states']) >= self.memory_capacity:
                 print("[Server] train_ppo memory is full, start update ...")
                 self.tensityPPOAgent.update()
 
-            # e) 存储历史信息(可选)
-            acc_list = [info[0] for info in client_infos]
-            time_list = [info[1] for info in client_infos]
-            self.history["round"].append(r + 1)
-            self.history["client_accs"].append(acc_list)
-            self.history["client_times"].append(time_list)
-
-            # f) 准备进入下一个 round
+            # (e) 准备下轮
             prune_ratios = next_prune_ratios
+            prune_logprobs = next_prune_lp
             train_intensities = next_train_intensities
+            train_logprobs = next_train_lp
 
+        print("[Server] Training finished. All rounds complete.")
         # ---- 结束所有轮次 ----
-        print("[Server] Training finished.")
