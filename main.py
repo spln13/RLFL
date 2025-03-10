@@ -20,6 +20,6 @@ def main():
         client = Client(i, device, model, 1, 1, save_path, batch_size, lr, gamma, k_epochs, eps_clip)
         clients.append(client)
 
-    server = Server(device, clients, 'cifar10')
+    server = Server(device, clients, 'cifar10', 10)
     server.Run()
 
