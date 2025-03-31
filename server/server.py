@@ -190,6 +190,8 @@ class Server(object):
 
         # =============== STEP 3: 进入主循环 =================
         round_count = 0
+        rewards1 = []
+        rewards2 = []
         for r in range(num_rounds):
             round_count += 1
             done = (r == num_rounds - 1)  # 是否最后一轮
@@ -244,7 +246,8 @@ class Server(object):
                 R1 = float(acc) - float(old_pr)
                 # PPO2 reward = -time_used(示例:时间越长回报越低)
                 R2 = - float(time_used)
-
+                rewards1.append(R1)
+                rewards2.append(R2)
                 # ------- 3) 存储到 PPO memory -------
                 # Prune PPO
                 self.pruningPPOAgent.store_transition(
