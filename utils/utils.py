@@ -8,7 +8,7 @@ import torch
 # 创建自定义的 Dataset
 def read_data(dataset, idx, is_train=True, is_local_test=False):
     if is_local_test:
-        test_data_dir = os.path.join('./dataset', dataset, 'local_test/')
+        test_data_dir = os.path.join('../dataset', dataset, 'local_test/')
 
         test_file = test_data_dir + str(idx) + '.npz'
         with open(test_file, 'rb') as f:
@@ -17,7 +17,7 @@ def read_data(dataset, idx, is_train=True, is_local_test=False):
         return test_data
 
     if is_train:
-        train_data_dir = os.path.join('./dataset', dataset, 'train/')
+        train_data_dir = os.path.join('../dataset', dataset, 'train/')
 
         train_file = train_data_dir + str(idx) + '.npz'
         with open(train_file, 'rb') as f:
@@ -26,7 +26,7 @@ def read_data(dataset, idx, is_train=True, is_local_test=False):
         return train_data
 
     else:
-        test_data_dir = os.path.join('./dataset', dataset, 'test/')
+        test_data_dir = os.path.join('../dataset', dataset, 'test/')
 
         test_file = test_data_dir + str(idx) + '.npz'
         with open(test_file, 'rb') as f:

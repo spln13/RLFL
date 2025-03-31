@@ -8,13 +8,15 @@ from PPO.training_tensity_ppo import TrainIntensityPPOAgent
 
 
 class Server(object):
-    def __init__(self, device, clients, dataset, memory_capacity):
+    def __init__(self, device, clients, dataset, memory_capacity, init_models_pr):
         self.device = device
         self.clients = clients  # list of Client objects
         self.dataset = dataset
         self.memory_capacity = memory_capacity
+        self.init_models_pr = init_models_pr  # 算法初始化时剪枝得到模型的剪枝率列表
         self.pruningPPOAgent = PruningPPOAgent(5, 3)
         self.tensityPPOAgent = TrainIntensityPPOAgent(5, 3)
+        self.init_models_save_path = './init_models/'
         self.history = {
             "round": [],
             "client_accs": [],
@@ -109,28 +111,29 @@ class Server(object):
             client.save_model(client_model, client_model.cfg, client_model.mask)  # 每个client保存自己模型到本地
 
 
-    def Run(self):
-        """
-        开始算法过程
-        """
-        # 给每个client分配初始模型
-        for client in self.clients:
-            client.init_first_model()
-        # 每个client 初始化训练
-        training_times = []
-        for client in self.clients:
-            training_time = client.first_evaluate()
-            training_times.append(training_time)
+    def init_models(self):
+        # 根据剪枝率列表，提前将各个剪枝率的模型剪枝好发送到客户端
+        pr_list = self.init_models_pr
+        for i, pr in enumerate(pr_list):
+            #  生成剪枝率为pr的模型
+            model = MiniVGG(dataset=self.dataset)
+            pruned_model = self.prune(model, pr)
+            # save model
+            torch.save({
+                'cfg': pruned_model.cfg,
+                'mask': pruned_model.mask,
+                'state_dict': pruned_model.state_dict(),
+            }, self.init_models_save_path + str(pr) + '.pth')
 
-        # 根据训练时间，第一次分配模型大小以及训练强度 调openAI
 
     def run(self, num_rounds=10):
         """
         总的流程：
-          1) 给所有客户端分发初始模型；客户端做一次“小规模测试训练”并把准确率、训练时间上传
-          2) 服务器调用 PPO，得到每个客户端的(训练强度, 剪枝率)
-          3) 进入主循环：执行N轮:
-             a) 下发本轮的剪枝率/训练强度给客户端 => 客户端 train => 返回(准确率, 时间)
+          1) 设定模型剪枝率列表，提前将各个剪枝率的模型剪枝好发送到客户端
+          2) 给所有客户端分发初始模型；客户端做一次“小规模测试训练”并把准确率、训练时间上传
+          3) 服务器调用 PPO，得到每个客户端的(训练强度, 剪枝率)
+          4) 进入主循环：执行N轮:
+             a) 下发本轮的剪枝率/训练强度给客户端 => 客户端 train => 返回(准确率, 时间) (如果选择模型和上一轮大小不一致则需要KD)
              b) 聚合 aggravate(...)
              c) 基于本轮训练信息, 调用 PPO, 得到下一轮新的动作 (训练强度, 剪枝率)
              d) 存储 RL 经验, 若内存满则 ppo.update()
@@ -138,6 +141,9 @@ class Server(object):
         # -------------------------
         # (1) 初始模型下发 & 客户端测试训练
         # -------------------------
+        print("[Server] Step 0: Init pruned models pool")
+        self.init_models()
+
         print("[Server] Step 1: Distribute initial model, do a test/assessment training")
         init_results = []
 
@@ -166,13 +172,13 @@ class Server(object):
             prune_action, prune_lp = self.pruningPPOAgent.select_action(state_ppo1)
             # 做一个限制, 避免过小
             prune_action = 0.05 + 0.95 * prune_action
-
+            print(f"acc: {acc}, time: {time_used}, prune_action: {prune_action}, prune_lp: {prune_lp}")
             # 3) 训练强度 PPO
             train_action, train_lp = self.tensityPPOAgent.select_action(state_ppo2)
             # 映射到 [1, 10] => epoch
             # 如果train_action是负值, int时要clip
             train_action = max(1, int(train_action * 10))
-
+            print(f"acc: {acc}, time: {time_used}, train_action: {train_action}, train_lp: {train_lp}")
             # 保存下来
             prune_ratios.append(prune_action)
             prune_logprobs.append(prune_lp)
@@ -210,7 +216,7 @@ class Server(object):
 
             # (b) 聚合 => 得到新的 global_model
             # self.global_model = self.aggregator(self.clients)
-            self.aggregate()
+            self.aggregate()  # 保存到self.path
             print("[Server] Aggregation done, global_model updated.")
 
             # (c) 计算 PPO 的 (state, action, reward) 并存储
@@ -288,3 +294,89 @@ class Server(object):
 
         print("[Server] Training finished. All rounds complete.")
         # ---- 结束所有轮次 ----
+
+    def prune(self, model, pruning_rate):
+        # cfg = model.cfg
+        mask = model.mask
+        total = 0
+        for layer_mask in mask:
+            total += len(layer_mask)
+        bn = torch.zeros(total)  # bn用于存储模型中所有bn层中缩放因子的绝对值
+        index = 0
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                size = m.weight.data.shape[0]
+                bn[index:index + size] = m.weight.data.abs().clone()
+                index += size
+
+        y, i = torch.sort(bn)  # 对缩放因子 升序排列
+        threshold_index = int(total * pruning_rate)
+        threshold = y[threshold_index]  # 获得缩放因子门槛值，低于此门槛值的channel被prune掉
+        pruned = 0
+        new_cfg = []  # 每个bn层剩余的通道数或者是maxpooling层, 用于初始化模型
+        new_cfg_mask = []  # 存储layer_mask数组
+        layer_index = 0  # 当前layer下标 当前层为batchnorm才++
+        for k, m in enumerate(model.modules()):
+            if isinstance(m, nn.BatchNorm2d):
+                weight_copy = m.weight.data.clone()
+                layer_mask = weight_copy.ge(threshold).float()  # 01数组
+                indices = [i for i, x in enumerate(mask[layer_index]) if x == 1.0]  # 获取之前mask中所有保留通道的下标
+                if torch.sum(layer_mask) == 0:  # 如果所有通道都被剪枝了，则保留权重最大的一个通道
+                    _, idx = torch.max(weight_copy, 0)
+                    layer_mask[idx.item()] = 1.0
+                layer_mask = layer_mask.to(self.device)
+                pruned += layer_mask.shape[0] - torch.sum(layer_mask)
+                m.weight.data.mul_(layer_mask)
+                m.bias.data.mul(layer_mask)
+                idx = 0
+                for _, tag in enumerate(layer_mask):
+                    if tag == 0.:  # 该通道应该被剪枝
+                        old_mask_index = indices[idx]  # 获取对应之前mask中的下标
+                        idx += 1
+                        mask[layer_index][old_mask_index] = 0.  # 将mask中对应通道
+                new_cfg.append(int(torch.sum(layer_mask)))
+                new_cfg_mask.append(layer_mask.clone())
+                print('layer index: {:d} \t total channel: {:d} \t remaining channel: {:d}'.
+                      format(k, layer_mask.shape[0], int(torch.sum(layer_mask))))
+                layer_index += 1
+            elif isinstance(m, nn.MaxPool2d):
+                new_cfg.append('M')
+        model.cfg = new_cfg
+        model.mask = new_cfg_mask
+        new_model = MiniVGG(cfg=new_cfg, dataset=self.dataset).to(self.device)
+        layer_id_in_cfg = 0
+        start_mask = torch.ones(3)  # 当前layer_id的层开始时的通道 cifar初始三个输入通道全部保留
+        end_mask = new_cfg_mask[layer_id_in_cfg]  # 当前layer_id的层结束时的通道
+        for [m0, m1] in zip(model.modules(), new_model.modules()):
+            if isinstance(m0, nn.BatchNorm2d):
+                idx1 = np.squeeze(
+                    np.argwhere(np.asarray(end_mask.cpu().numpy())))  # idx1是end_mask值非0的下标 squeeze()转换为1维数组
+                if idx1.size == 1:  # 若只有一个元素则会成为标量，需要转成数组
+                    idx1 = np.resize(idx1, (1,))
+                m1.weight.data = m0.weight.data[idx1.tolist()].clone()
+                m1.bias.data = m0.bias.data[idx1.tolist()].clone()
+                m1.running_mean = m0.running_mean[idx1.tolist()].clone()
+                m1.running_var = m0.running_var[idx1.tolist()].clone()
+                layer_id_in_cfg += 1
+                start_mask = end_mask.clone()
+                if layer_id_in_cfg < len(new_cfg_mask):  # do not change in Final FC
+                    end_mask = new_cfg_mask[layer_id_in_cfg]
+            elif isinstance(m0, nn.Conv2d):
+                idx0 = np.squeeze(np.argwhere(np.asarray(start_mask.cpu().numpy())))
+                idx1 = np.squeeze(np.argwhere(np.asarray(end_mask.cpu().numpy())))
+                print('In shape: {:d}, Out shape {:d}.'.format(idx0.size, idx1.size))
+                if idx0.size == 1:
+                    idx0 = np.resize(idx0, (1,))
+                if idx1.size == 1:
+                    idx1 = np.resize(idx1, (1,))
+                w1 = m0.weight.data[:, idx0.tolist(), :, :].clone()  # [out_channels, int_channels, H, W]
+                w1 = w1[idx1.tolist(), :, :, :].clone()
+                m1.weight.data = w1.clone()
+            elif isinstance(m0, nn.Linear):
+                idx0 = np.squeeze(np.argwhere(np.asarray(start_mask.cpu().numpy())))
+                if idx0.size == 1:
+                    idx0 = np.resize(idx0, (1,))
+                m1.weight.data = m0.weight.data[:, idx0].clone()
+                m1.bias.data = m0.bias.data.clone()
+
+        return new_model

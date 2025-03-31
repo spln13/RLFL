@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from model.vgg import MiniVGG
-from utils import read_client_data
+from utils.utils import read_client_data
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -23,9 +23,51 @@ class Client(object):
         self.kd_epochs = kd_epochs
         self.kd_alpha = kd_alpha
         self.temperature = temperature
-        self.model_path = save_path + '_client_' + str(client_id) + '.pth'  # checkpoint path
+        self.model_path = save_path + '/client/' + 'client_' + str(client_id) + '.pth'  # checkpoint path
+        self.aggregated_model_path = save_path + 'aggregated' + '_client_' + str(client_id) + '.pth'
         self.information_entropy = self.get_information_entropy()
+        self.model_pool_base_path = save_path + '/model_pool/' + '_client_' + str(client_id) + '_'
+        self.model_pruning_rate_list = []
+        self.last_pruning_rate = 0
         pass
+
+
+    def get_model_pool_path(self, pr):
+        return self.model_pool_base_path + '_pr' + str(pr) + '.pth'
+
+    def save_aggregated_model(self, model, cfg, mask):
+        """保存模型到disk"""
+        torch.save({
+            'cfg': model.cfg,
+            'mask': model.mask,
+            'state_dict': model.state_dict(),
+        }, self.aggregated_model_path)
+
+
+    def load_aggregated_model(self):
+        """
+        加载聚合后的模型
+        """
+        checkpoint = torch.load(self.aggregated_model_path)
+        cfg = checkpoint['cfg']
+        mask = checkpoint['mask']
+        if self.model == 'vgg':
+            model = MiniVGG(cfg=cfg, dataset=self.dataset)
+        else:
+            raise NotImplementedError
+        model.load_state_dict(checkpoint['state_dict'])
+        model.mask = mask
+        return model
+
+    def load_model_from_pool(self, pr):
+        """从初始的模型池中加载一个模型"""
+        # given pruning rate, load a pruned model from model pool
+        pruned_model_path = self.model_pool_base_path + str(pr) + '.pth'
+        checkpoint = torch.load(pruned_model_path)
+        cfg = checkpoint['cfg']
+        model = MiniVGG(cfg)
+        model.load_state_dict(checkpoint['state_dict'])
+        return model
 
 
     def load_train_data(self, batch_size=None):
@@ -75,7 +117,7 @@ class Client(object):
         criterion = nn.CrossEntropyLoss()
         losses = []
         s = self.s
-        start_time = time.time() # 记录训练开始时间
+        start_time = time.time()  # 记录训练开始时间
         for epoch in range(epochs):
             if epoch in [int(epochs * 0.5), int(epochs * 0.75)]:
                 for param_group in optimizer.param_groups:
@@ -97,15 +139,15 @@ class Client(object):
                             m.weight.grad.data.add_(s * torch.sign(m.weight.data))  # L1
                 optimizer.step()
                 train_loader_tqdm.set_description(f'Train Epoch: {epoch} Loss: {loss.item():.6f}')
-        self.save_model(model, model.cfg, model.mask)
         end_time = time.time()
         total_time = end_time - start_time
         # 在client本地测试集跑一下得到acc一并返回给server
+        self.save_model(model, model.cfg, model.mask)
         acc = self.local_test()
         return acc, total_time
 
 
-    def finetune(self, model_teacher, model_student, epochs=10, alpha=0.5, temperature=2.0):
+    def knowledge_distillation(self, model_teacher, model_student, epochs=10, alpha=0.5, temperature=2.0):
         """
         参数:
             model_teacher: 教师模型 (已训练好，参数固定)
@@ -201,93 +243,22 @@ class Client(object):
         acc = 100. * correct / len(test_loader.dataset)
         return acc
 
-    def prune(self, pruning_rate):
-        model = self.load_model()
-        cfg = model.cfg
-        mask = model.mask
-        total = 0
-        for layer_mask in mask:
-            total += len(layer_mask)
-        bn = torch.zeros(total)  # bn用于存储模型中所有bn层中缩放因子的绝对值
-        index = 0
-        for m in model.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                size = m.weight.data.shape[0]
-                bn[index:index + size] = m.weight.data.abs().clone()
-                index += size
 
-        y, i = torch.sort(bn)  # 对缩放因子 升序排列
-        threshold_index = int(total * pruning_rate)
-        threshold = y[threshold_index]  # 获得缩放因子门槛值，低于此门槛值的channel被prune掉
-        pruned = 0
-        new_cfg = []  # 每个bn层剩余的通道数或者是maxpooling层, 用于初始化模型
-        new_cfg_mask = []  # 存储layer_mask数组
-        layer_index = 0  # 当前layer下标 当前层为batchnorm才++
-        for k, m in enumerate(model.modules()):
-            if isinstance(m, nn.BatchNorm2d):
-                weight_copy = m.weight.data.clone()
-                layer_mask = weight_copy.ge(threshold).float()  # 01数组
-                indices = [i for i, x in enumerate(mask[layer_index]) if x == 1.0]  # 获取之前mask中所有保留通道的下标
-                if torch.sum(layer_mask) == 0:  # 如果所有通道都被剪枝了，则保留权重最大的一个通道
-                    _, idx = torch.max(weight_copy, 0)
-                    layer_mask[idx.item()] = 1.0
-                layer_mask = layer_mask.to(self.device)
-                pruned += layer_mask.shape[0] - torch.sum(layer_mask)
-                m.weight.data.mul_(layer_mask)
-                m.bias.data.mul(layer_mask)
-                idx = 0
-                for _, tag in enumerate(layer_mask):
-                    if tag == 0.:  # 该通道应该被剪枝
-                        old_mask_index = indices[idx]  # 获取对应之前mask中的下标
-                        idx += 1
-                        mask[layer_index][old_mask_index] = 0.  # 将mask中对应通道
-                new_cfg.append(int(torch.sum(layer_mask)))
-                new_cfg_mask.append(layer_mask.clone())
-                print('layer index: {:d} \t total channel: {:d} \t remaining channel: {:d}'.
-                      format(k, layer_mask.shape[0], int(torch.sum(layer_mask))))
-                layer_index += 1
-            elif isinstance(m, nn.MaxPool2d):
-                new_cfg.append('M')
-        model.cfg = new_cfg
-        model.mask = new_cfg_mask
-        new_model = MiniVGG(cfg=new_cfg, dataset=self.dataset).to(self.device)
-        layer_id_in_cfg = 0
-        start_mask = torch.ones(3)  # 当前layer_id的层开始时的通道 cifar初始三个输入通道全部保留
-        end_mask = new_cfg_mask[layer_id_in_cfg]  # 当前layer_id的层结束时的通道
-        for [m0, m1] in zip(model.modules(), new_model.modules()):
-            if isinstance(m0, nn.BatchNorm2d):
-                idx1 = np.squeeze(
-                    np.argwhere(np.asarray(end_mask.cpu().numpy())))  # idx1是end_mask值非0的下标 squeeze()转换为1维数组
-                if idx1.size == 1:  # 若只有一个元素则会成为标量，需要转成数组
-                    idx1 = np.resize(idx1, (1,))
-                m1.weight.data = m0.weight.data[idx1.tolist()].clone()
-                m1.bias.data = m0.bias.data[idx1.tolist()].clone()
-                m1.running_mean = m0.running_mean[idx1.tolist()].clone()
-                m1.running_var = m0.running_var[idx1.tolist()].clone()
-                layer_id_in_cfg += 1
-                start_mask = end_mask.clone()
-                if layer_id_in_cfg < len(new_cfg_mask):  # do not change in Final FC
-                    end_mask = new_cfg_mask[layer_id_in_cfg]
-            elif isinstance(m0, nn.Conv2d):
-                idx0 = np.squeeze(np.argwhere(np.asarray(start_mask.cpu().numpy())))
-                idx1 = np.squeeze(np.argwhere(np.asarray(end_mask.cpu().numpy())))
-                print('In shape: {:d}, Out shape {:d}.'.format(idx0.size, idx1.size))
-                if idx0.size == 1:
-                    idx0 = np.resize(idx0, (1,))
-                if idx1.size == 1:
-                    idx1 = np.resize(idx1, (1,))
-                w1 = m0.weight.data[:, idx0.tolist(), :, :].clone()  # [out_channels, int_channels, H, W]
-                w1 = w1[idx1.tolist(), :, :, :].clone()
-                m1.weight.data = w1.clone()
-            elif isinstance(m0, nn.Linear):
-                idx0 = np.squeeze(np.argwhere(np.asarray(start_mask.cpu().numpy())))
-                if idx0.size == 1:
-                    idx0 = np.resize(idx0, (1,))
-                m1.weight.data = m0.weight.data[:, idx0].clone()
-                m1.bias.data = m0.bias.data.clone()
+    def Do(self, pruning_rate, tensity):
+        # 首先从self.model_pruning_rate_list获取最接近的pruning_rate
+        # 然后根据pruning_rate和tensity进行训练, tensity就是本地训练的epochs
+        pr = min(self.model_pruning_rate_list, key=lambda x: abs(x - pruning_rate))
+        # 根据pr去load模型
+        if pr == self.last_pruning_rate:
+            # 直接使用聚合后的模型进行训练
+            acc, training_time = self.train()
+        else:
+            # 剪枝率不一样了
+            # 需要重新init一个剪枝率为pr的模型，将aggregated model蒸馏到这个模型上
+            aggregated_model = self.load_aggregated_model()
+            # 将aggregated model蒸馏到self model上
 
 
-        return new_model
 
 
     def get_information_entropy(self):

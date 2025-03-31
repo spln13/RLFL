@@ -14,6 +14,7 @@ class MiniVGG(nn.Module):
         self.in_channels = 3 if dataset == 'cifar10' or dataset == 'ImageNet10' else 1
         if cfg is None:
             cfg = mini_vgg_cfg
+        self.cfg = cfg
         self.feature = self.make_layers(cfg)
         self.fc1 = nn.Linear(128 * 8 * 8, 256)
         self.fc2 = nn.Linear(256, num_classes)
