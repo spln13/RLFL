@@ -11,18 +11,18 @@ from tqdm import tqdm
 
 
 class Client(object):
-    def __init__(self, client_id, device, model, pruning_rate, training_intensity, save_path, dataset, batch_size=16, s=0.0001, kd_epochs=10, kd_alpha=0.5, temperature=2.0):
+    def __init__(self, client_id, device, model, training_intensity, save_path, dataset, batch_size=16, s=0.0001, kd_epochs=10, kd_alpha=0.5, temperature=2.0):
         self.id = client_id
         self.device = device
         self.model = model
         self.dataset = dataset
-        self.pruning_rate = pruning_rate
         self.training_intensity = training_intensity
         self.batch_size = batch_size
         self.s = s
         self.kd_epochs = kd_epochs
         self.kd_alpha = kd_alpha
         self.temperature = temperature
+        self.pr = 1.
         self.model_path = save_path + '/client/' + 'client_' + str(client_id) + '.pth'  # checkpoint path
         self.aggregated_model_path = save_path + 'aggregated' + '_client_' + str(client_id) + '.pth'
         self.information_entropy = self.get_information_entropy()
@@ -105,7 +105,6 @@ class Client(object):
             'mask': mask,
             'state_dict': model.state_dict(),
         }, self.model_path)
-        pass
 
     def train(self, sr=False):
         """模型训练制定epoch，需要统计训练时间，sr为是否加上network slimming的正则项"""
@@ -144,6 +143,7 @@ class Client(object):
         # 在client本地测试集跑一下得到acc一并返回给server
         self.save_model(model, model.cfg, model.mask)
         acc = self.local_test()
+        print("[client{} accuracy] accuracy: {}".format(self.id, acc))
         return acc, total_time
 
 
@@ -244,9 +244,11 @@ class Client(object):
         return acc
 
 
-    def Do(self, pruning_rate, tensity):
+    def local_do(self, pruning_rate, tensity):
         # 首先从self.model_pruning_rate_list获取最接近的pruning_rate
         # 然后根据pruning_rate和tensity进行训练, tensity就是本地训练的epochs
+        self.pr = pruning_rate
+        self.training_intensity = tensity
         pr = min(self.model_pruning_rate_list, key=lambda x: abs(x - pruning_rate))
         # 根据pr去load模型
         if pr == self.last_pruning_rate:
@@ -255,10 +257,11 @@ class Client(object):
         else:
             # 剪枝率不一样了
             # 需要重新init一个剪枝率为pr的模型，将aggregated model蒸馏到这个模型上
-            aggregated_model = self.load_aggregated_model()
+            aggregated_model = self.load_aggregated_model()  # teacher model
             # 将aggregated model蒸馏到self model上
-
-
+            new_model = self.load_model_from_pool(pr)
+            self.knowledge_distillation(aggregated_model, new_model, tensity)
+            self.save_model(new_model, new_model.cfg, new_model.mask)
 
 
     def get_information_entropy(self):

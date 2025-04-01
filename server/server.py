@@ -148,9 +148,6 @@ class Server(object):
         init_results = []
 
         for client in self.clients:
-            client.init_first_model()  # 下发初始模型
-
-        for client in self.clients:
             # 让客户端进行一次小规模测试训练(或评估)
             # 假设客户端返回 (acc, time_used) 表示准确率和训练时间
             acc, time_used = client.first_evaluate()
