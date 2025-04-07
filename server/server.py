@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -114,11 +115,26 @@ class Server(object):
     def init_models(self):
         # 根据剪枝率列表，提前将各个剪枝率的模型剪枝好发送到客户端
         pr_list = self.init_models_pr
-        for i, pr in enumerate(pr_list):
+        for _, pr in enumerate(pr_list):
             #  生成剪枝率为pr的模型
             model = MiniVGG(dataset=self.dataset)
+            # 这里生成model.mask
+            mask = []  # 初始mask生成全1
+            # for item in cfg:
+            #     if item == 'M':
+            #         continue
+            #     arr = [1.0 for _ in range(item)]
+            #     mask.append(torch.tensor(arr))
+            for module in model.modules():
+                if isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.Linear):
+                    channels = module.weight.data.shape[0]
+                    arr = [1.0 for _ in range(channels)]
+                    mask.append(arr)
+            model.mask = mask
             pruned_model = self.prune(model, pr)
             # save model
+            if not os.path.exists(self.init_models_save_path):
+                os.makedirs(self.init_models_save_path)
             torch.save({
                 'cfg': pruned_model.cfg,
                 'mask': pruned_model.mask,
@@ -146,6 +162,9 @@ class Server(object):
 
         print("[Server] Step 1: Distribute initial model, do a test/assessment training")
         init_results = []
+
+        for client in self.clients:
+            client.init_first_model()  # 下发初始模型
 
         for client in self.clients:
             # 让客户端进行一次小规模测试训练(或评估)
@@ -324,7 +343,6 @@ class Server(object):
                 if torch.sum(layer_mask) == 0:  # 如果所有通道都被剪枝了，则保留权重最大的一个通道
                     _, idx = torch.max(weight_copy, 0)
                     layer_mask[idx.item()] = 1.0
-                layer_mask = layer_mask.to(self.device)
                 pruned += layer_mask.shape[0] - torch.sum(layer_mask)
                 m.weight.data.mul_(layer_mask)
                 m.bias.data.mul(layer_mask)

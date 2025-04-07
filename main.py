@@ -23,3 +23,5 @@ def main():
 
     server = Server(device, clients, 'cifar10', 10, pr_list)
     server.run()
+
+main()
