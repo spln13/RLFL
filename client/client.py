@@ -84,7 +84,9 @@ class Client(object):
         pass
 
     def load_small_model(self):
-        return MiniVGG(dataset=self.dataset)
+        # 这里应该load model pool中最小的模型
+        pr = self.model_pruning_rate_list[0]
+        return self.load_model_from_pool(pr)
 
     def load_model(self):
         checkpoint = torch.load(self.model_path)
@@ -276,8 +278,9 @@ class Client(object):
         算法开始时，训练小模型得到训练时间T
         """
         model = self.load_small_model()
-        # train model
-        epoch = 1
+        # train model 50 轮
+        # epoch = 1
+        epoch = 50
         model = model.to(self.device)
         train_loader = self.load_train_data()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)

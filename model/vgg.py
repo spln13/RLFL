@@ -41,6 +41,21 @@ class MiniVGG(nn.Module):
         x = self.fc2(x)
         return x
 
+    def generate_mask(self):
+        # 生成模型mask
+        mask = []  # 初始mask生成全1
+        # for item in cfg:
+        #     if item == 'M':
+        #         continue
+        #     arr = [1.0 for _ in range(item)]
+        #     mask.append(torch.tensor(arr))
+        for module in self.modules():
+            if isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.Linear):
+                channels = module.weight.data.shape[0]
+                arr = [1.0 for _ in range(channels)]
+                mask.append(arr)
+        model.mask = mask
+
 
 # 测试模型
 if __name__ == "__main__":

@@ -2,7 +2,10 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
+from torch.utils.data import DataLoader
 
+from utils.utils import read_client_data
 from model.vgg import MiniVGG
 from PPO.pruning_rate_ppo import PruningPPOAgent
 from PPO.training_tensity_ppo import TrainIntensityPPOAgent
@@ -119,18 +122,7 @@ class Server(object):
             #  生成剪枝率为pr的模型
             model = MiniVGG(dataset=self.dataset)
             # 这里生成model.mask
-            mask = []  # 初始mask生成全1
-            # for item in cfg:
-            #     if item == 'M':
-            #         continue
-            #     arr = [1.0 for _ in range(item)]
-            #     mask.append(torch.tensor(arr))
-            for module in model.modules():
-                if isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.Linear):
-                    channels = module.weight.data.shape[0]
-                    arr = [1.0 for _ in range(channels)]
-                    mask.append(arr)
-            model.mask = mask
+            model.generate_mask()
             pruned_model = self.prune(model, pr)
             # save model
             if not os.path.exists(self.init_models_save_path):
@@ -162,9 +154,6 @@ class Server(object):
 
         print("[Server] Step 1: Distribute initial model, do a test/assessment training")
         init_results = []
-
-        for client in self.clients:
-            client.init_first_model()  # 下发初始模型
 
         for client in self.clients:
             # 让客户端进行一次小规模测试训练(或评估)
@@ -315,7 +304,8 @@ class Server(object):
         # ---- 结束所有轮次 ----
 
     def prune(self, model, pruning_rate):
-        # cfg = model.cfg
+        model = self.train(model)
+        model.generate_mask()
         mask = model.mask
         total = 0
         for layer_mask in mask:
@@ -398,3 +388,42 @@ class Server(object):
                 m1.bias.data = m0.bias.data.clone()
 
         return new_model
+
+    def train(self, model, sr=True, epochs=50):
+        """模型训练制定epoch，需要统计训练时间，sr为是否加上network slimming的正则项"""
+        model = model.to(self.device)
+        train_loader = self.load_train_data()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
+        criterion = nn.CrossEntropyLoss()
+        losses = []
+        s = 0.0001
+        for epoch in range(epochs):
+            if epoch in [int(epochs * 0.5), int(epochs * 0.75)]:
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] *= 0.1
+            # training
+            model.train()
+            train_loader_tqdm = tqdm(enumerate(train_loader), total=len(train_loader), leave=False)
+            for batch_idx, (data, target) in train_loader_tqdm:
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                # pred = output.data.max(1, keepdim=True)[1]
+                losses.append(loss.item())
+                loss.backward()
+                if sr:  # update batchnorm
+                    for m in model.modules():
+                        if isinstance(m, nn.BatchNorm2d):
+                            m.weight.grad.data.add_(s * torch.sign(m.weight.data))  # L1
+                optimizer.step()
+                train_loader_tqdm.set_description(f'Train Epoch: {epoch} Loss: {loss.item():.6f}')
+        # 在client本地测试集跑一下得到acc一并返回给server
+        return model
+
+    def load_train_data(self, batch_size=None):
+        if batch_size is None:
+            batch_size = 64
+        client_id = -1  # 为统一代码假设服务器的client_id为-1
+        train_data = read_client_data(self.dataset, client_id, is_train=True)
+        return DataLoader(train_data, batch_size, drop_last=True, shuffle=True)
