@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 
 class Client(object):
-    def __init__(self, client_id, device, model, training_intensity, save_path, dataset, batch_size=16, s=0.0001, kd_epochs=10, kd_alpha=0.5, temperature=2.0):
+    def __init__(self, client_id, device, model, training_intensity, save_path, dataset, pr_list, batch_size=16, s=0.0001, kd_epochs=10, kd_alpha=0.5, temperature=2.0):
         self.id = client_id
         self.device = device
         self.model = model
@@ -26,8 +26,8 @@ class Client(object):
         self.model_path = save_path + '/client/' + 'client_' + str(client_id) + '.pth'  # checkpoint path
         self.aggregated_model_path = save_path + 'aggregated' + '_client_' + str(client_id) + '.pth'
         self.information_entropy = self.get_information_entropy()
-        self.model_pool_base_path = save_path + '/model_pool/' + '_client_' + str(client_id) + '_'
-        self.model_pruning_rate_list = []
+        self.model_pool_base_path = 'init_models/'
+        self.model_pruning_rate_list = pr_list
         self.last_pruning_rate = 0
         pass
 
