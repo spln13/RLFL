@@ -67,7 +67,7 @@ class MiniVGG(nn.Module):
                 channels = module.weight.data.shape[0]
                 arr = [1.0 for _ in range(channels)]
                 mask.append(arr)
-        model.mask = mask
+        self.mask = mask
 
     def _initialize_weights(self):
         for m in self.modules():

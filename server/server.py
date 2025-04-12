@@ -18,8 +18,8 @@ class Server(object):
         self.dataset = dataset
         self.memory_capacity = memory_capacity
         self.init_models_pr = init_models_pr  # 算法初始化时剪枝得到模型的剪枝率列表
-        self.pruningPPOAgent = PruningPPOAgent(5, 3)
-        self.tensityPPOAgent = TrainIntensityPPOAgent(5, 3)
+        self.pruningPPOAgent = PruningPPOAgent(2, 3)
+        self.tensityPPOAgent = TrainIntensityPPOAgent(2, 3)
         self.init_models_save_path = './init_models/'
         self.history = {
             "round": [],
@@ -209,7 +209,7 @@ class Server(object):
                 ti = train_intensities[i]
 
                 # 客户端本地训练, 传入(剪枝率, 训练轮数)
-                acc, time_used = client.train(pr, ti)
+                acc, time_used = client.local_do(pr, ti)
 
                 # 记录这次训练得到的信息
                 client_infos.append({
