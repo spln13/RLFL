@@ -167,6 +167,8 @@ class Client(object):
         # 常规交叉熵损失
         criterion_ce = nn.CrossEntropyLoss()
         losses = []
+        distillation_start = time.time()
+        teacher_inference_time = 0.0 # 教师模型训练时间
         for epoch in range(epochs):
             epoch_loss = 0.0
 
@@ -176,8 +178,11 @@ class Client(object):
                 optimizer.zero_grad()
 
                 # 教师模型输出 (不需要计算梯度)
+                teacher_start_time = time.time()
                 with torch.no_grad():
                     logits_teacher = model_teacher(data)
+                teacher_end_time = time.time()
+                teacher_inference_time += teacher_end_time - teacher_start_time
 
                 # 学生模型输出
                 logits_student = model_student(data)
@@ -204,7 +209,11 @@ class Client(object):
             losses.append(avg_loss)
             print(f"Epoch {epoch + 1}, Loss: {avg_loss:.4f}")
 
-        return model_student
+        distillation_end = time.time()
+        distillation_time = distillation_end - distillation_start - teacher_inference_time
+        print(f"Knowledge distillation time: {distillation_time:.2f} seconds")
+        return model_student, distillation_time
+
 
     def test(self):
         model = self.load_model()
@@ -261,9 +270,11 @@ class Client(object):
             aggregated_model = self.load_aggregated_model()  # teacher model
             # 将aggregated model蒸馏到self model上
             new_model = self.load_model_from_pool(pr)
-            self.knowledge_distillation(aggregated_model, new_model, tensity)
+            student_model, training_time = self.knowledge_distillation(aggregated_model, new_model, tensity)
+            acc = self.local_test(student_model)
             self.save_model(new_model, new_model.cfg, new_model.mask)
 
+        return acc, training_time
 
     def get_information_entropy(self):
         """
