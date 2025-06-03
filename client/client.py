@@ -62,7 +62,7 @@ class Client(object):
     def load_model_from_pool(self, pr):
         """从初始的模型池中加载一个模型"""
         # given pruning rate, load a pruned model from model pool
-        pruned_model_path = self.model_pool_base_path + str(self.id) + '/' + str(pr) + '.pth'
+        pruned_model_path = self.model_pool_base_path + str(pr) + '.pth'
         checkpoint = torch.load(pruned_model_path)
         cfg = checkpoint['cfg']
         model = MiniVGG(cfg)
@@ -224,9 +224,8 @@ class Client(object):
                                                                                       100. * correct / len(
                                                                                           test_loader.dataset)))
 
-    def local_test(self) -> float:
+    def local_test(self, model) -> float:
         # client使用本地小测试集进行测试，返回准确率供PPO模型参考
-        model = self.load_model()
         test_loader = self.load_test_data(batch_size=128)
         model = model.to(self.device)
         model.eval()
@@ -249,7 +248,6 @@ class Client(object):
     def local_do(self, pruning_rate, tensity):
         # 首先从self.model_pruning_rate_list获取最接近的pruning_rate
         # 然后根据pruning_rate和tensity进行训练, tensity就是本地训练的epochs
-        # 需要return acc和训练时间
         self.pr = pruning_rate
         self.training_intensity = tensity
         pr = min(self.model_pruning_rate_list, key=lambda x: abs(x - pruning_rate))
@@ -260,17 +258,12 @@ class Client(object):
         else:
             # 剪枝率不一样了
             # 需要重新init一个剪枝率为pr的模型，将aggregated model蒸馏到这个模型上
-            # TODO: 确认模型蒸馏怎么算training_time
-            model = self.load_model()  # load上一轮的model
-            # 替换model_pool中的model
             aggregated_model = self.load_aggregated_model()  # teacher model
             # 将aggregated model蒸馏到self model上
             new_model = self.load_model_from_pool(pr)
             self.knowledge_distillation(aggregated_model, new_model, tensity)
             self.save_model(new_model, new_model.cfg, new_model.mask)
 
-        self.last_pruning_rate = pruning_rate
-        # 训练完成后，使用小模型进行测试
 
     def get_information_entropy(self):
         """
@@ -285,8 +278,7 @@ class Client(object):
         """
         model = self.load_small_model()
         # train model 50 轮
-        # epoch = 1
-        epoch = 50
+        epoch = 1
         model = model.to(self.device)
         train_loader = self.load_train_data()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=1e-4)
@@ -309,6 +301,6 @@ class Client(object):
         training_time = end_time - start_time
 
         # 在client本地测试集跑一下得到acc一并返回给server
-        acc = self.local_test()
+        acc = self.local_test(model)
 
         return acc, training_time

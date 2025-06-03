@@ -174,12 +174,12 @@ class PruningPPOAgent:
 # =============== 3. 简单测试 ===============
 if __name__ == "__main__":
     # 假设状态维度是 5
-    agent = PruningPPOAgent(state_dim=5, hidden_dim=64)
+    agent = PruningPPOAgent(state_dim=2, hidden_dim=64)
 
     # 人为构造一些(状态->动作->回报)的数据
     # 实际使用中，您需要把"剪枝完的模型大小、精度"等作为reward的依据
     for step in range(10):
-        state = np.random.randn(5)
+        state = np.random.randn(2)
         action, logprob = agent.select_action(state)
         # 这里 action 即是剪枝率, (0~1)
         # 根据您的需求来算 reward
@@ -192,6 +192,6 @@ if __name__ == "__main__":
     agent.update()
 
     # 下次再 select_action(...) 就会用到更新后的策略
-    test_state = np.random.randn(5)
+    test_state = np.random.randn(2)
     new_action, _ = agent.select_action(test_state)
     print("Prune ratio after update:", new_action)

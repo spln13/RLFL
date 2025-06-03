@@ -389,7 +389,7 @@ class Server(object):
 
         return new_model
 
-    def train(self, model, sr=True, epochs=50):
+    def train(self, model, sr=True, epochs=1):
         """模型训练制定epoch，需要统计训练时间，sr为是否加上network slimming的正则项"""
         model = model.to(self.device)
         train_loader = self.load_train_data()
